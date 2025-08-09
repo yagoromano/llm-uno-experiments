@@ -1,0 +1,160 @@
+import argparse
+import rlcard
+from rlcard import models
+import csv, os
+import numpy as np
+from rlcard.agents.human_agents.uno_human_agent import HumanAgent, _print_action
+from llm_uno.custom_uno_game import CustomUnoGame
+from llm_uno.random_agent import RandomAgent
+from llm_uno.openrouter import OpenRouter
+
+# HARDCODED_API_KEY = "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"
+
+parser = argparse.ArgumentParser(description="Run UNO AI with DeepSeek R1 via OpenRouter.")
+parser.add_argument("--api-key", type=str, help="OpenRouter API Key.")
+args = parser.parse_args()
+
+api_key = args.api_key
+
+# Configure the environment for 3 players
+env = rlcard.make("uno", config={"game_num_players": 3})
+env.game.__class__ = CustomUnoGame # Required to correctly calculate payoffs
+env.game.configure({"game_num_players": 3})
+env.num_players = 3
+
+
+cfr_agent = models.load("uno-rule-v1").agents[0]
+random_agent = RandomAgent(env.num_actions)
+
+open_router_agent = OpenRouter(env.num_actions, api_key, model_id="deepseek/deepseek-chat:free", template_path="llama8B_cloze.txt")
+
+# Set the agents
+env.set_agents([random_agent, random_agent, open_router_agent])
+
+# Initialize data storage
+game_results = []
+win_counts = {i: 0 for i in range(env.num_players)}
+
+
+for game_id in range(1, 3):
+    print(f"Starting game {game_id}")
+    
+    env.reset()
+    game_duration = 0
+    cards_in_hand_history = {i: [] for i in range(env.num_players)}
+    played_card_log = []
+    llm_hand_history = []
+    game_direction = 1
+    llm_all_probs = []
+
+    while not env.is_over():
+        player_id = env.game.round.current_player
+        state = env.game.get_state(player_id)
+
+        next_player = (player_id + game_direction) % env.num_players
+        llm_next_player = 0 if game_direction == 1 else 1
+
+        # Store number of cards per player
+        if "num_cards" in state:
+            for i in range(env.num_players):
+                cards_in_hand_history[i].append(state["num_cards"][i])
+        else:
+            print(f"Warning: 'num_cards' missing from state for Player {player_id}: {state}")
+
+        if isinstance(env.agents[player_id], OpenRouter):
+            action, hand = env.agents[player_id].step(env._extract_state(state), played_card_log, llm_next_player)
+            llm_hand_history.append(hand)
+
+        else:
+            action = env.agents[player_id].step(env._extract_state(state))
+            hand = None
+
+        # Convert action to a readable format if necessary
+        played_card_log.append((player_id, action))
+        
+        # Check for reverse card, etc.
+        last_played_card = played_card_log[-1][1] if played_card_log else None
+        if last_played_card and isinstance(last_played_card, str) and "reverse" in last_played_card:
+            game_direction *= -1
+            print(f"Reverse played! New turn order: {'Forward' if game_direction == 1 else 'Reversed'}")
+
+        print(f">> Player {player_id} chooses {action}")
+        env.game.step(action)
+        game_duration += 1
+
+    # Get final results
+    payoffs = np.array(env.get_payoffs())
+
+    # Determine winner(s)
+    winner_indices = np.where(payoffs == 1)[0]
+
+    if len(winner_indices) == 0:
+        print(f"Warning: No player won in Game {game_id}. Possible timeout or issue in game logic.")
+        winner_id = None
+        winner = "No winner"
+    else:
+        winner_id = winner_indices[0]
+        winner = f"Player {winner_id}"
+        win_counts[winner_id] += 1
+
+    # Assign payoffs correctly
+    adjusted_payoffs = np.full(len(payoffs), -1)  # Default -1 for all players
+    if winner_id is not None:
+        adjusted_payoffs[winner_id] = 1  # Only the winner gets 1
+
+    print(f"Game {game_id} over. Winner: {winner}, Payoffs: {adjusted_payoffs.tolist()}")
+
+    # Store the results
+    game_results.append({
+        "Game ID": game_id,
+        "Winner": winner,
+        "Game Duration (Turns)": game_duration, 
+        "Player 0 Score (Rand)": adjusted_payoffs[0],
+        "Player 1 Score (Rand)": adjusted_payoffs[1],
+        "Player 2 Score (LLM)": adjusted_payoffs[2],
+        "adjusted_payoffs": adjusted_payoffs.tolist(),
+        "Cards in Hand History": {i: cards_in_hand_history[i] for i in range(env.num_players)},
+        "Played Cards Log": played_card_log,
+        "LLM Hand History": llm_hand_history
+    })
+
+# Write results to CSV file
+
+base_filename = "openrouter"
+file_extension = ".csv"
+output_file = f"{base_filename}{file_extension}"
+file_index = 1
+
+
+while os.path.exists(output_file):
+    output_file = f"{base_filename}_{file_index}{file_extension}"
+    file_index += 1
+    
+
+with open(output_file, mode="w", newline="") as file:
+    writer = csv.writer(file)
+
+    # Write header row
+    header_row = ["Game ID", "Winner", "Game Duration (Turns)", "Player 0", "Player 1", "Player 2", "Cards in Hand History", "Played Cards Log", "LLM Hand History"]
+    writer.writerow(header_row)
+
+    # Write wins row
+    wins_row = ["Number of Wins", "", "", ""] + [win_counts[i] for i in range(env.num_players)]
+    writer.writerow(wins_row)
+
+    # Write payoffs row
+    payoffs_header = ["Final Payoffs", "", "", ""] + ["Payoff"] * env.num_players
+    writer.writerow(payoffs_header)
+
+    for result in game_results:
+        writer.writerow([
+            result["Game ID"],
+            result["Winner"],
+            result["Game Duration (Turns)"],
+            *result["adjusted_payoffs"],
+            str(result["Cards in Hand History"]),
+            str(result["Played Cards Log"]),   
+            str(result["LLM Hand History"])
+        ])
+
+print(f"Results saved to {output_file}")
